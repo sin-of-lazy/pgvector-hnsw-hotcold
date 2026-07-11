@@ -43,7 +43,7 @@ This project is based on pgvector and focuses on HNSW index analysis and optimiz
 
 ## 2. GitHub 版本管理方法
 
-### 2.1 安装 Git
+### 2.1 安装 Git√
 
 先确认本机是否已经安装 Git：
 
@@ -72,12 +72,12 @@ git config --global user.email "你的 GitHub 邮箱"
 git config --global --list
 ```
 
-### 2.2 在当前项目中初始化 Git
+### 2.2 在当前项目中初始化 Git√
 
 进入项目目录：
 
 ```powershell
-cd F:\_WORK\PgVector
+cd F:/_WORK/PgVector
 ```
 
 初始化仓库：
@@ -151,12 +151,14 @@ Visibility: Public 或 Private
 
 ```text
 https://github.com/你的用户名/pgvector-hnsw-hotcold.git
+https://github.com/sin-of-lazy/pgvector-hnsw-hotcold.git
 ```
 
 绑定远程仓库：
 
 ```powershell
 git remote add origin https://github.com/你的用户名/pgvector-hnsw-hotcold.git
+git remote add origin https://github.com/sin-of-lazy/pgvector-hnsw-hotcold.git
 ```
 
 确认远程仓库：
@@ -378,6 +380,7 @@ https://www.postgresql.org/download/windows/
 
 ```text
 C:\Program Files\PostgreSQL\17
+F:\postgresql
 ```
 
 或：
@@ -402,6 +405,9 @@ C:\Program Files\PostgreSQL\18
 ```powershell
 & "C:\Program Files\PostgreSQL\18\bin\psql.exe" --version
 & "C:\Program Files\PostgreSQL\18\bin\pg_config.exe" --version
+
+& "F:\postgresql\bin\psql.exe" --version
+& "F:\postgresql\bin\pg_config.exe" --version
 ```
 
 `pg_config.exe` 很重要，它会告诉扩展编译系统 PostgreSQL 的头文件和库文件在哪里。
