@@ -57,7 +57,7 @@ There is no standalone lint target in this repo. CI relies on strict compiler wa
 - Upgrade path is migration-script based:
   - canonical schema: `sql/vector.sql`
   - versioned migrations: `sql/vector--X--Y.sql`
-  - current release SQL is produced as `sql/vector--0.8.2.sql` from `sql/vector.sql` during build.
+  - current release SQL is produced as `sql/vector--0.8.4.sql` from `sql/vector.sql` during build.
 
 ## Key conventions specific to this codebase
 

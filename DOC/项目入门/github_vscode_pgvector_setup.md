@@ -321,7 +321,7 @@ git push origin v0.2.0
 
 ## 3. VS Code 开发环境配置
 
-### 3.1 安装 VS Code
+### 3.1 安装 VS Code√
 
 下载地址：
 
@@ -366,7 +366,7 @@ x64 Native Tools Command Prompt for VS
 
 ---
 
-## 4. 安装 PostgreSQL
+## 4. 安装 PostgreSQL√
 
 ### 4.1 推荐安装方式
 
@@ -431,7 +431,7 @@ pg_config --version
 
 ---
 
-## 5. 安装 C/C++ 编译工具
+## 5. 安装 C/C++ 编译工具√
 
 ### 5.1 安装 Visual Studio Build Tools
 
