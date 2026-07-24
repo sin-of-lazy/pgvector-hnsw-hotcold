@@ -37,6 +37,17 @@ int			hnsw_iterative_scan;
 int			hnsw_max_scan_tuples;
 double		hnsw_scan_mem_multiplier;
 int			hnsw_lock_tranche_id;
+
+/* Hot/cold buffer-pool prefetch (Phase 1) */
+bool		hnsw_hot_cold_enabled = false;
+int			hnsw_hot_layer = 2;
+int			hnsw_hot_max_bytes = 64 * 1024;		/* reserved for future use */
+int			hnsw_prefetch_neighbors = 16;
+
+/* Semi-dynamic ef_search (Phase 2) */
+bool		hnsw_ef_search_auto = false;
+double		hnsw_ef_search_multiplier = 2.0;
+
 static relopt_kind hnsw_relopt_kind;
 
 /*
@@ -107,6 +118,55 @@ HnswInit(void)
 	DefineCustomRealVariable("hnsw.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",
 							 NULL, &hnsw_scan_mem_multiplier,
 							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * Hot/cold buffer-pool prefetch GUCs (Phase 1).
+	 *
+	 * These are safe knobs: they only trigger PrefetchBuffer() hints on
+	 * neighbor index pages during HNSW scan. Turning them on/off must never
+	 * change query results, only latency and buffer-hit behavior.
+	 */
+	DefineCustomBoolVariable("hnsw.hot_cold_enabled",
+							 "Enables buffer-pool prefetch of HNSW neighbor pages",
+							 NULL, &hnsw_hot_cold_enabled,
+							 false, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.hot_layer",
+							"Minimum HNSW layer at which to apply hot prefetch",
+							"Layers >= this value are considered hot and prefetched more aggressively.",
+							&hnsw_hot_layer,
+							2, 0, 255, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.hot_max_bytes",
+							"Reserved: soft cap for future hot-layer cache in bytes",
+							"Currently a placeholder for compatibility with the test harness.",
+							&hnsw_hot_max_bytes,
+							64 * 1024, 0, INT_MAX, PGC_USERSET, GUC_UNIT_BYTE, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("hnsw.prefetch_neighbors",
+							"Number of neighbor index pages to prefetch per HNSW node",
+							"0 disables prefetch even if hnsw.hot_cold_enabled is on.",
+							&hnsw_prefetch_neighbors,
+							16, 0, HNSW_MAX_M * 2, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * Phase 2: Semi-dynamic ef_search.
+	 *
+	 * When auto=on, the iterative scan path progressively increases batch_size
+	 * by ef_search_multiplier on each resume, allowing the search to widen
+	 * when initial ef_search was insufficient. This keeps the first scan pass
+	 * latency low while improving recall for iterative/streaming use cases.
+	 */
+	DefineCustomBoolVariable("hnsw.ef_search_auto",
+							 "Enable semi-dynamic ef_search expansion for iterative scans",
+							 NULL, &hnsw_ef_search_auto,
+							 false, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomRealVariable("hnsw.ef_search_multiplier",
+							 "Multiplier for expanding ef_search on each iterative scan resume",
+							 "Batch size = base ef_search * multiplier^(resume_count). Clamped to max_ef_search.",
+							 &hnsw_ef_search_multiplier,
+							 2.0, 1.0, 10.0, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("hnsw");
 }

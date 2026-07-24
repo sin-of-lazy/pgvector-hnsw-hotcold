@@ -65,7 +65,22 @@ ResumeScanItems(IndexScanDesc scan)
 	Relation	index = scan->indexRelation;
 	List	   *ep = NIL;
 	char	   *base = NULL;
-	int			batch_size = hnsw_ef_search;
+	int			batch_size;
+
+	/*
+	 * Phase 2: semi-dynamic ef_search. When auto mode is enabled, each
+	 * successive resume uses a larger batch_size (capped at HNSW_MAX_EF_SEARCH)
+	 * so the search progressively widens.
+	 */
+	if (hnsw_ef_search_auto)
+	{
+		double scaled = hnsw_ef_search * pow(hnsw_ef_search_multiplier, (double) so->resumeCount);
+		batch_size = Min((int) scaled, HNSW_MAX_EF_SEARCH);
+	}
+	else
+		batch_size = hnsw_ef_search;
+
+	so->resumeCount++;
 
 	if (pairingheap_is_empty(so->discarded))
 		return NIL;
@@ -174,6 +189,7 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->discarded = NULL;
 	so->tuples = 0;
 	so->previousDistance = -get_float8_infinity();
+	so->resumeCount = 0;
 	MemoryContextReset(so->tmpCtx);
 
 	if (keys && scan->numberOfKeys > 0)

@@ -143,6 +143,16 @@ extern int	hnsw_max_scan_tuples;
 extern double hnsw_scan_mem_multiplier;
 extern int	hnsw_lock_tranche_id;
 
+/* Hot/cold buffer-pool prefetch (Phase 1) */
+extern bool hnsw_hot_cold_enabled;
+extern int	hnsw_hot_layer;
+extern int	hnsw_hot_max_bytes;
+extern int	hnsw_prefetch_neighbors;
+
+/* Semi-dynamic ef_search (Phase 2) */
+extern bool hnsw_ef_search_auto;
+extern double hnsw_ef_search_multiplier;
+
 typedef enum HnswIterativeScanMode
 {
 	HNSW_ITERATIVE_SCAN_OFF,
@@ -407,6 +417,9 @@ typedef struct HnswScanOpaqueData
 
 	/* Support functions */
 	HnswSupport support;
+
+	/* Phase 2: track how many times we have resumed for auto ef_search */
+	int			resumeCount;
 }			HnswScanOpaqueData;
 
 typedef HnswScanOpaqueData * HnswScanOpaque;

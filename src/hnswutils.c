@@ -899,6 +899,23 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		else
 			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
 
+		/* Hot/cold prefetch: issue asynchronous I/O hints for neighbor pages */
+		if (!inMemory && hnsw_hot_cold_enabled && hnsw_prefetch_neighbors > 0)
+		{
+			int			prefetchCount = Min(unvisitedLength, hnsw_prefetch_neighbors);
+
+			if (lc < hnsw_hot_layer)
+				prefetchCount = Min(prefetchCount, 4);
+
+			for (int pi = 0; pi < prefetchCount; pi++)
+			{
+				BlockNumber blk = ItemPointerGetBlockNumber(&unvisited[pi].indextid);
+
+				if (blk != InvalidBlockNumber)
+					PrefetchBuffer(index, MAIN_FORKNUM, blk);
+			}
+		}
+
 		/* OK to count elements instead of tuples */
 		if (tuples != NULL)
 			(*tuples) += unvisitedLength;
