@@ -1,1351 +1,363 @@
-# pgvector
+# pgvector HNSW 查询与构建优化
 
-Open-source vector similarity search for Postgres
+> **面向 AI Infra / RAG 在线检索场景的 PostgreSQL pgvector 向量索引优化项目**  
+> 基于 pgvector 0.8.4，针对 HNSW 索引的查询路径、动态参数调优、构建期性能和并行扩展进行优化与验证。
 
-Store your vectors with the rest of your data. Supports:
+---
 
-- exact and approximate nearest neighbor search
-- single-precision, half-precision, binary, and sparse vectors
-- L2 distance, inner product, cosine distance, L1 distance, Hamming distance, and Jaccard distance
-- any [language](#languages) with a Postgres client
+## 项目背景
 
-Plus [ACID](https://en.wikipedia.org/wiki/ACID) compliance, point-in-time recovery, JOINs, and all of the other [great features](https://www.postgresql.org/about/) of Postgres
+### 为什么优化 pgvector HNSW？
 
-Have a lot of vectors? Use [quantization](#scaling) to scale
+在 RAG（Retrieval-Augmented Generation）和 AI Agent Memory 等场景中，向量检索是核心热路径：
 
-[![Build Status](https://github.com/pgvector/pgvector/actions/workflows/build.yml/badge.svg)](https://github.com/pgvector/pgvector/actions)
+- **在线查询延迟敏感**：P95/P99 尾延迟直接影响用户体验
+- **召回率（Recall@K）不可妥协**：宁可慢一点，也不能漏掉相关文档
+- **数据规模持续增长**：从 10 万到百万级向量，索引超出内存时 I/O 成为瓶颈
+- **参数调优复杂**：`ef_search` 固定值难以平衡不同查询的召回和延迟
 
-## Installation
+pgvector 的 HNSW 索引是 PostgreSQL 生态中最成熟的 ANN（近似最近邻）方案，但在大规模、高并发、低延迟场景下仍有优化空间。
 
-### Linux and Mac
+### 本项目解决的问题
 
-Compile and install the extension (supports Postgres 13+)
+| 问题 | 官方行为 | 本项目优化 | 收益 |
+|---|---|---|---|
+| **查询路径随机 I/O** | 逐个加载邻居节点，触发 buffer miss 时阻塞等待 | 提前发起 `PrefetchBuffer`，将串行 I/O 转并行 | 200k 行时 avg -26.5%, **p99 -55.9%** |
+| **ef_search 固定** | 用户设一个静态值，过滤场景下可能不足 | iterative scan 时按倍率自动扩展 batch_size | 带过滤查询 -21.8% |
+| **构建期瓶颈不明** | 无官方工具量化 I/O vs CPU | 提供 `probe_build.sql` 观测脚本 | 确认瓶颈在 CPU 距离计算，避免盲目优化 |
+| **并行构建加速比不清晰** | 支持并行但无加速曲线 | `probe_parallel_build.sql` 量化 0/1/2/4 workers | 2 workers 达 2.13x，4 workers 边际递减 |
 
-```sh
-cd /tmp
-git clone --branch v0.8.4 https://github.com/pgvector/pgvector.git
-cd pgvector
-make
-make install # may need sudo
+---
+
+## 核心优化
+
+### Phase 1: HNSW 查询路径 Buffer Pool 预取
+
+**设计思路**
+
+HNSW 查询时会从入口点逐层下降到第 0 层，每层遍历候选节点的邻居。邻居节点通常分布在不同索引页上，容易产生随机 buffer miss。
+
+我们在 `HnswSearchLayer` 中，于**真正加载邻居元素之前**，对即将访问的 neighbor index pages 发起 `PrefetchBuffer` 异步 I/O 提示，让 PostgreSQL Buffer Pool 提前准备相关页面。
+
+**代码落点**：`src/hnswutils.c:900-920`
+
+```c
+if (!inMemory && hnsw_hot_cold_enabled && hnsw_prefetch_neighbors > 0) {
+    int prefetchCount = Min(unvisitedLength, hnsw_prefetch_neighbors);
+    if (lc < hnsw_hot_layer)
+        prefetchCount = Min(prefetchCount, 4);  // 低层限流，避免无效预取
+    for (int pi = 0; pi < prefetchCount; pi++) {
+        BlockNumber blk = ItemPointerGetBlockNumber(&unvisited[pi].indextid);
+        if (blk != InvalidBlockNumber)
+            PrefetchBuffer(index, MAIN_FORKNUM, blk);
+    }
+}
 ```
 
-See the [installation notes](#installation-notes---linux-and-mac) if you run into issues
+**新增 GUC**
 
-You can also install it with [Docker](#docker), [Homebrew](#homebrew), [PGXN](#pgxn), [APT](#apt), [Yum](#yum), [pkg](#pkg), [APK](#apk), or [conda-forge](#conda-forge), and it comes preinstalled with [Postgres.app](#postgresapp) and many [hosted providers](#hosted-postgres). There are also instructions for [GitHub Actions](https://github.com/pgvector/setup-pgvector).
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `hnsw.hot_cold_enabled` | bool | `off` | 总开关，`off` 时等价官方 0.8.4 |
+| `hnsw.hot_layer` | int | `2` | 高层（`>= hot_layer`）更积极预取，低层限流到 4 个 |
+| `hnsw.prefetch_neighbors` | int | `16` | 每次迭代最多预取的邻居页数 |
+| `hnsw.hot_max_bytes` | int | `65536` | 预留参数，为后续 hot cache 保留 |
 
-### Windows
+**效果（200k 行 128 维，ef_search=200）**
 
-Ensure [C++ support in Visual Studio](https://learn.microsoft.com/en-us/cpp/build/building-on-the-command-line?view=msvc-170#download-and-install-the-tools) is installed and run `x64 Native Tools Command Prompt for VS [version]` as administrator. Then use `nmake` to build:
+| 指标 | off | on | 改善 |
+|---|---:|---:|---:|
+| Recall@10 | 0.478 | 0.478 | **0%（语义不变）** |
+| avg | 22.95 ms | **15.42 ms** | **-32.8%** |
+| p50 | 21.77 ms | 14.53 ms | -33.3% |
+| p95 | 27.52 ms | 20.53 ms | -25.4% |
+| p99 | 48.09 ms | **21.23 ms** | **-55.9%** |
+
+---
+
+### Phase 2: 半动态 `ef_search` 自动扩展
+
+**设计思路**
+
+当前 `hnsw.ef_search` 是静态 GUC。对于带 `WHERE` 过滤的查询，初始 `ef_search` 可能因过滤掉大量候选而导致召回不足。
+
+pgvector 已有 **iterative scan** 机制（`hnsw.iterative_scan = strict_order | relaxed_order`），会在候选不足时从 `discarded` 堆中 resume 搜索。我们在每次 resume 时按 `ef_search_multiplier` 递增 `batch_size`，让搜索逐步加宽。
+
+**代码落点**：`src/hnswscan.c:62-87` 的 `ResumeScanItems`
+
+```c
+if (hnsw_ef_search_auto) {
+    double scaled = hnsw_ef_search * pow(hnsw_ef_search_multiplier, (double) so->resumeCount);
+    batch_size = Min((int) scaled, HNSW_MAX_EF_SEARCH);
+} else {
+    batch_size = hnsw_ef_search;
+}
+so->resumeCount++;
+```
+
+**新增 GUC**
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `hnsw.ef_search_auto` | bool | `off` | 开启后 iterative scan 时自动扩展 batch |
+| `hnsw.ef_search_multiplier` | real | `2.0` | 扩展倍率，clamp 到 `HNSW_MAX_EF_SEARCH` |
+
+**效果（20k 行 64 维 + `WHERE tag = 42` 约 1% 命中率）**
+
+| 配置 | Execution Time | shared hit |
+|---|---:|---:|
+| `ef_search_auto = off` | 16.9 ms | 12660 |
+| `ef_search_auto = on` (×2.0) | **13.2 ms (-21.8%)** | 15413 |
+
+虽然 buffer 访问增加了 ~22%，但 resume 轮数减少，总延迟反而降低。
+
+---
+
+### Phase 3: HNSW 构建期 I/O 观测
+
+**目标**：量化 `CREATE INDEX ... USING hnsw` 的耗时来源，判断是否需要 build-time prefetch。
+
+**工具**：`test/hot_cold/bench/probe_build.sql`（使用 `pg_stat_io` 抓取 per-context I/O）
+
+**结论**（10k 行 128 维，`maintenance_work_mem=256MB`）：
+
+| 指标 | 值 |
+|---|---:|
+| Build time | 5082 ms |
+| Index size | 8128 kB |
+| relation reads | **2** |
+| relation extends | 1016 |
+| relation hits | 11880 |
+
+在充足 `maintenance_work_mem` 下 build 是 **in-memory + 追加写**，`reads=2` 说明几乎没有回读磁盘。瓶颈是 **CPU 距离计算 + 图连接**，不是 I/O。
+
+**决策**：Phase 3 **只交付观测脚本，不改代码**。只有当 `maintenance_work_mem` 远小于图规模时才需要考虑 build-time prefetch。
+
+---
+
+### Phase 4: 并行构建锁竞争观测
+
+**目标**：量化 `max_parallel_maintenance_workers` 对 build 耗时的影响，识别锁竞争热点。
+
+**工具**：`test/hot_cold/bench/probe_parallel_build.sql`（sweep 0/1/2/4 workers）
+
+**结果**（20k 行 128 维）
+
+| workers | build time (ms) | speedup |
+|:---:|---:|---:|
+| 0 (serial) | 11736 | 1.00x |
+| 1 | 7324 | 1.60x |
+| 2 | 5500 | **2.13x** |
+| 4 | 5028 | 2.33x |
+
+从 2→4 workers 边际收益骤降（2.13x → 2.33x），且 `pg_stat_activity` 的 wait_event 快照为空，说明当前规模下**无显著锁竞争**，瓶颈是 CPU 计算或共享内存分配的顺序化。
+
+**决策**：Phase 4 **只交付观测脚本**。锁粒度优化要等 500k+ 行且内存不足的场景才有意义。
+
+---
+
+## 环境要求
+
+| 组件 | 版本/要求 |
+|---|---|
+| PostgreSQL | ≥ 13（已测试 18.4） |
+| 编译器（Windows） | Visual Studio 2017+ (MSVC) with C++ |
+| 编译器（Linux/macOS） | GCC/Clang + PostgreSQL dev headers |
+| pgvector | 基于 0.8.4 |
+
+---
+
+## 快速开始
+
+### 1. 编译并安装
+
+**Windows (x64 Native Tools Command Prompt)**
 
 ```cmd
-set "PGROOT=C:\Program Files\PostgreSQL\18"
-cd %TEMP%
-git clone --branch v0.8.4 https://github.com/pgvector/pgvector.git
-cd pgvector
+set "PGROOT=F:\postgresql"
+cd /d F:\_WORK\PgVector
+nmake /F Makefile.win clean
 nmake /F Makefile.win
 nmake /F Makefile.win install
 ```
 
-See the [installation notes](#installation-notes---windows) if you run into issues
+**Linux / macOS**
 
-You can also install it with [Docker](#docker) or [conda-forge](#conda-forge).
+```bash
+export PG_CONFIG=/path/to/pg_config
+cd pgvector-hnsw-hotcold
+make clean
+make
+sudo make install
+```
 
-## Getting Started
+重启 PostgreSQL 服务后，在数据库中启用：
 
-Enable the extension (do this once in each database where you want to use it)
-
-```tsql
+```sql
 CREATE EXTENSION vector;
 ```
 
-Create a vector column with 3 dimensions
+### 2. 验证优化已安装
 
 ```sql
-CREATE TABLE items (id bigserial PRIMARY KEY, embedding vector(3));
+-- 官方 0.8.4 有 4 个 hnsw.* GUC
+-- 优化版有 10 个（+6 个新增）
+SELECT COUNT(*) FROM pg_settings WHERE name LIKE 'hnsw.%';
+-- 应返回 10
+
+SHOW hnsw.hot_cold_enabled;       -- off
+SHOW hnsw.ef_search_auto;         -- off
 ```
 
-Insert vectors
+### 3. 启用优化并测试
 
 ```sql
-INSERT INTO items (embedding) VALUES ('[1,2,3]'), ('[4,5,6]');
-```
-
-Get the nearest neighbors by L2 distance
-
-```sql
-SELECT * FROM items ORDER BY embedding <-> '[3,1,2]' LIMIT 5;
-```
-
-Also supports inner product (`<#>`), cosine distance (`<=>`), and L1 distance (`<+>`)
-
-Note: `<#>` returns the negative inner product since Postgres only supports `ASC` order index scans on operators
-
-## Storing
-
-Create a new table with a vector column
-
-```sql
-CREATE TABLE items (id bigserial PRIMARY KEY, embedding vector(3));
-```
-
-Or add a vector column to an existing table
-
-```sql
-ALTER TABLE items ADD COLUMN embedding vector(3);
-```
-
-Also supports [half-precision](#half-precision-vectors), [binary](#binary-vectors), and [sparse](#sparse-vectors) vectors
-
-Insert vectors
-
-```sql
-INSERT INTO items (embedding) VALUES ('[1,2,3]'), ('[4,5,6]');
-```
-
-Or load vectors in bulk using `COPY` ([example](https://github.com/pgvector/pgvector-python/blob/master/examples/loading/example.py))
-
-```sql
-COPY items (embedding) FROM STDIN WITH (FORMAT BINARY);
-```
-
-Upsert vectors
-
-```sql
-INSERT INTO items (id, embedding) VALUES (1, '[1,2,3]'), (2, '[4,5,6]')
-    ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding;
-```
-
-Update vectors
-
-```sql
-UPDATE items SET embedding = '[1,2,3]' WHERE id = 1;
-```
-
-Delete vectors
-
-```sql
-DELETE FROM items WHERE id = 1;
-```
-
-## Querying
-
-Get the nearest neighbors to a vector
-
-```sql
-SELECT * FROM items ORDER BY embedding <-> '[3,1,2]' LIMIT 5;
-```
-
-Supported distance functions are:
-
-- `<->` - L2 distance
-- `<#>` - (negative) inner product
-- `<=>` - cosine distance
-- `<+>` - L1 distance
-- `<~>` - Hamming distance (binary vectors)
-- `<%>` - Jaccard distance (binary vectors)
-
-Get the nearest neighbors to a row
-
-```sql
-SELECT * FROM items WHERE id != 1 ORDER BY embedding <-> (SELECT embedding FROM items WHERE id = 1) LIMIT 5;
-```
-
-Get rows within a certain distance
-
-```sql
-SELECT * FROM items WHERE embedding <-> '[3,1,2]' < 5;
-```
-
-Note: Combine with `ORDER BY` and `LIMIT` to use an index
-
-#### Distances
-
-Get the distance
-
-```sql
-SELECT embedding <-> '[3,1,2]' AS distance FROM items;
-```
-
-For inner product, multiply by -1 (since `<#>` returns the negative inner product)
-
-```tsql
-SELECT (embedding <#> '[3,1,2]') * -1 AS inner_product FROM items;
-```
-
-For cosine similarity, use 1 - cosine distance
-
-```sql
-SELECT 1 - (embedding <=> '[3,1,2]') AS cosine_similarity FROM items;
-```
-
-#### Aggregates
-
-Average vectors
-
-```sql
-SELECT AVG(embedding) FROM items;
-```
-
-Average groups of vectors
-
-```sql
-SELECT category_id, AVG(embedding) FROM items GROUP BY category_id;
-```
-
-## Indexing
-
-By default, pgvector performs exact nearest neighbor search, which provides perfect recall.
-
-You can add an index to use approximate nearest neighbor search, which trades some recall for speed. Unlike typical indexes, you will see different results for queries after adding an approximate index.
-
-Supported index types are:
-
-- [HNSW](#hnsw)
-- [IVFFlat](#ivfflat)
-
-## HNSW
-
-An HNSW index creates a multilayer graph. It has better query performance than IVFFlat (in terms of speed-recall tradeoff), but has slower build times and uses more memory. Also, an index can be created without any data in the table since there isn’t a training step like IVFFlat.
-
-Add an index for each distance function you want to use.
-
-L2 distance
-
-```sql
+-- 建表 + 索引
+CREATE TABLE items (id bigserial PRIMARY KEY, embedding vector(128));
+INSERT INTO items SELECT g, ARRAY(SELECT random() FROM generate_series(1,128))::vector
+FROM generate_series(1, 100000) g;
 CREATE INDEX ON items USING hnsw (embedding vector_l2_ops);
-```
-
-Note: Use `halfvec_l2_ops` for `halfvec` and `sparsevec_l2_ops` for `sparsevec` (and similar with the other distance functions)
-
-Inner product
-
-```sql
-CREATE INDEX ON items USING hnsw (embedding vector_ip_ops);
-```
-
-Cosine distance
-
-```sql
-CREATE INDEX ON items USING hnsw (embedding vector_cosine_ops);
-```
-
-L1 distance
-
-```sql
-CREATE INDEX ON items USING hnsw (embedding vector_l1_ops);
-```
-
-Hamming distance
-
-```sql
-CREATE INDEX ON items USING hnsw (embedding bit_hamming_ops);
-```
-
-Jaccard distance
-
-```sql
-CREATE INDEX ON items USING hnsw (embedding bit_jaccard_ops);
-```
-
-Supported types are:
-
-- `vector` - up to 2,000 dimensions
-- `halfvec` - up to 4,000 dimensions
-- `bit` - up to 64,000 dimensions
-- `sparsevec` - up to 1,000 non-zero elements
-
-### Index Options
-
-Specify HNSW parameters
-
-- `m` - the max number of connections per layer (16 by default)
-- `ef_construction` - the size of the dynamic candidate list for constructing the graph (64 by default)
-
-```sql
-CREATE INDEX ON items USING hnsw (embedding vector_l2_ops) WITH (m = 16, ef_construction = 64);
-```
-
-A higher value of `ef_construction` provides better recall at the cost of index build time / insert speed.
-
-### Query Options
-
-Specify the size of the dynamic candidate list for search (40 by default)
-
-```sql
-SET hnsw.ef_search = 100;
-```
-
-A higher value provides better recall at the cost of speed.
-
-Use `SET LOCAL` inside a transaction to set it for a single query
-
-```sql
-BEGIN;
-SET LOCAL hnsw.ef_search = 100;
-SELECT ...
-COMMIT;
-```
-
-### Index Build Time
-
-Indexes build significantly faster when the graph fits into `maintenance_work_mem`
-
-```sql
-SET maintenance_work_mem = '8GB';
-```
-
-A notice is shown when the graph no longer fits
-
-```text
-NOTICE:  hnsw graph no longer fits into maintenance_work_mem after 100000 tuples
-DETAIL:  Building will take significantly more time.
-HINT:  Increase maintenance_work_mem to speed up builds.
-```
-
-Note: Do not set `maintenance_work_mem` so high that it exhausts the memory on the server
-
-Like other index types, it’s faster to create an index after loading your initial data
-
-You can also speed up index creation by increasing the number of parallel workers (2 by default)
-
-```sql
-SET max_parallel_maintenance_workers = 7; -- plus leader
-```
-
-For a large number of workers, you may need to increase `max_parallel_workers` (8 by default)
-
-The [index options](#index-options) also have a significant impact on build time (use the defaults unless seeing low recall)
-
-Use [binary quantization](#binary-quantization) for faster build times at scale
-
-### Indexing Progress
-
-Check [indexing progress](https://www.postgresql.org/docs/current/progress-reporting.html#CREATE-INDEX-PROGRESS-REPORTING)
-
-```sql
-SELECT phase, round(100.0 * blocks_done / nullif(blocks_total, 0), 1) AS "%" FROM pg_stat_progress_create_index;
-```
-
-The phases for HNSW are:
-
-1. `initializing`
-2. `loading tuples`
-
-## IVFFlat
-
-An IVFFlat index divides vectors into lists, and then searches a subset of those lists that are closest to the query vector. It has faster build times and uses less memory than HNSW, but has lower query performance (in terms of speed-recall tradeoff).
-
-Three keys to achieving good recall are:
-
-1. Create the index *after* the table has some data
-2. Choose an appropriate number of lists - a good place to start is `rows / 1000` for up to 1M rows and `sqrt(rows)` for over 1M rows
-3. When querying, specify an appropriate number of [probes](#query-options) (higher is better for recall, lower is better for speed) - a good place to start is `sqrt(lists)`
-
-Add an index for each distance function you want to use.
-
-L2 distance
-
-```sql
-CREATE INDEX ON items USING ivfflat (embedding vector_l2_ops) WITH (lists = 100);
-```
-
-Note: Use `halfvec_l2_ops` for `halfvec` (and similar with the other distance functions)
-
-Inner product
-
-```sql
-CREATE INDEX ON items USING ivfflat (embedding vector_ip_ops) WITH (lists = 100);
-```
-
-Cosine distance
-
-```sql
-CREATE INDEX ON items USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-```
-
-Hamming distance
-
-```sql
-CREATE INDEX ON items USING ivfflat (embedding bit_hamming_ops) WITH (lists = 100);
-```
-
-Supported types are:
-
-- `vector` - up to 2,000 dimensions
-- `halfvec` - up to 4,000 dimensions
-- `bit` - up to 64,000 dimensions
-
-### Query Options
-
-Specify the number of probes (1 by default)
-
-```sql
-SET ivfflat.probes = 10;
-```
-
-A higher value provides better recall at the cost of speed, and it can be set to the number of lists for exact nearest neighbor search (at which point the planner won’t use the index)
-
-Use `SET LOCAL` inside a transaction to set it for a single query
-
-```sql
-BEGIN;
-SET LOCAL ivfflat.probes = 10;
-SELECT ...
-COMMIT;
-```
-
-### Index Build Time
-
-Speed up index creation on large tables by increasing the number of parallel workers (2 by default)
-
-```sql
-SET max_parallel_maintenance_workers = 7; -- plus leader
-```
-
-For a large number of workers, you may also need to increase `max_parallel_workers` (8 by default)
-
-### Indexing Progress
-
-Check [indexing progress](https://www.postgresql.org/docs/current/progress-reporting.html#CREATE-INDEX-PROGRESS-REPORTING)
-
-```sql
-SELECT phase, round(100.0 * tuples_done / nullif(tuples_total, 0), 1) AS "%" FROM pg_stat_progress_create_index;
-```
-
-The phases for IVFFlat are:
-
-1. `initializing`
-2. `performing k-means`
-3. `assigning tuples`
-4. `loading tuples`
-
-Note: `%` is only populated during the `loading tuples` phase
-
-## Filtering
-
-There are a few ways to index nearest neighbor queries with a `WHERE` clause.
-
-```sql
-SELECT * FROM items WHERE category_id = 123 ORDER BY embedding <-> '[3,1,2]' LIMIT 5;
-```
-
-A good place to start is creating an index on the filter column. This can provide fast, exact nearest neighbor search in many cases. Postgres has a number of [index types](https://www.postgresql.org/docs/current/indexes-types.html) for this: B-tree (default), hash, GiST, SP-GiST, GIN, and BRIN.
-
-```sql
-CREATE INDEX ON items (category_id);
-```
-
-For multiple columns, consider a [multicolumn index](https://www.postgresql.org/docs/current/indexes-multicolumn.html).
-
-```sql
-CREATE INDEX ON items (location_id, category_id);
-```
-
-Exact indexes work well for conditions that match a low percentage of rows. Otherwise, [approximate indexes](#indexing) can work better.
-
-```sql
-CREATE INDEX ON items USING hnsw (embedding vector_l2_ops);
-```
-
-With approximate indexes, filtering is applied *after* the index is scanned. If a condition matches 10% of rows, with HNSW and the default `hnsw.ef_search` of 40, only 4 rows will match on average. For more rows, enable [iterative index scans](#iterative-index-scans), which will automatically scan more of the index when needed.
-
-```sql
-SET hnsw.iterative_scan = strict_order;
-```
-
-If filtering by only a few distinct values, consider [partial indexing](https://www.postgresql.org/docs/current/indexes-partial.html).
-
-```sql
-CREATE INDEX ON items USING hnsw (embedding vector_l2_ops) WHERE (category_id = 123);
-```
-
-If filtering by many different values, consider [partitioning](https://www.postgresql.org/docs/current/ddl-partitioning.html).
-
-```sql
-CREATE TABLE items (embedding vector(3), category_id int) PARTITION BY LIST(category_id);
-```
-
-## Iterative Index Scans
-
-With approximate indexes, queries with filtering can return less results since filtering is applied *after* the index is scanned. Starting with 0.8.0, you can enable iterative index scans, which will automatically scan more of the index until enough results are found (or it reaches `hnsw.max_scan_tuples` or `ivfflat.max_probes`).
-
-Iterative scans can use strict or relaxed ordering.
-
-Strict ensures results are in the exact order by distance
-
-```sql
-SET hnsw.iterative_scan = strict_order;
-```
-
-Relaxed allows results to be slightly out of order by distance, but provides better recall
-
-```sql
-SET hnsw.iterative_scan = relaxed_order;
-# or
-SET ivfflat.iterative_scan = relaxed_order;
-```
-
-With relaxed ordering, you can use a [materialized CTE](https://www.postgresql.org/docs/current/queries-with.html#QUERIES-WITH-CTE-MATERIALIZATION) to get strict ordering
-
-```sql
-WITH relaxed_results AS MATERIALIZED (
-    SELECT id, embedding <-> '[1,2,3]' AS distance FROM items WHERE category_id = 123 ORDER BY distance LIMIT 5
-) SELECT * FROM relaxed_results ORDER BY distance + 0;
-```
-
-Note: `+ 0` is needed for Postgres 17+
-
-For queries that filter by distance, use a materialized CTE and place the distance filter outside of it for best performance (due to the [current behavior](https://www.postgresql.org/message-id/flat/CAOdR5yGUoMQ6j7M5hNUXrySzaqZVGf_Ne%2B8fwZMRKTFxU1nbJg%40mail.gmail.com) of the Postgres executor)
-
-```sql
-WITH nearest_results AS MATERIALIZED (
-    SELECT id, embedding <-> '[1,2,3]' AS distance FROM items ORDER BY distance LIMIT 5
-) SELECT * FROM nearest_results WHERE distance < 5 ORDER BY distance;
-```
-
-Note: Place any other filters inside the CTE
-
-### Iterative Scan Options
-
-Since scanning a large portion of an approximate index is expensive, there are options to control when a scan ends.
-
-#### HNSW
-
-Specify the max number of tuples to visit (20,000 by default)
-
-```sql
-SET hnsw.max_scan_tuples = 20000;
-```
-
-Note: This is approximate and does not affect the initial scan
-
-Specify the max amount of memory to use, as a multiple of `work_mem` (1 by default)
-
-```sql
-SET hnsw.scan_mem_multiplier = 2;
-```
-
-Note: Try increasing this if increasing `hnsw.max_scan_tuples` does not improve recall
-
-#### IVFFlat
-
-Specify the max number of probes
-
-```sql
-SET ivfflat.max_probes = 100;
-```
-
-Note: If this is lower than `ivfflat.probes`, `ivfflat.probes` will be used
-
-## Half-Precision Vectors
-
-Use the `halfvec` type to store half-precision vectors
-
-```sql
-CREATE TABLE items (id bigserial PRIMARY KEY, embedding halfvec(3));
-```
-
-## Half-Precision Indexing
-
-Index vectors at half precision for smaller indexes
-
-```sql
-CREATE INDEX ON items USING hnsw ((embedding::halfvec(3)) halfvec_l2_ops);
-```
-
-Get the nearest neighbors
-
-```sql
-SELECT * FROM items ORDER BY embedding::halfvec(3) <-> '[1,2,3]' LIMIT 5;
-```
-
-## Binary Vectors
-
-Use the `bit` type to store binary vectors ([example](https://github.com/pgvector/pgvector-python/blob/master/examples/imagehash/example.py))
-
-```sql
-CREATE TABLE items (id bigserial PRIMARY KEY, embedding bit(3));
-INSERT INTO items (embedding) VALUES ('000'), ('111');
-```
-
-Get the nearest neighbors by Hamming distance
-
-```sql
-SELECT * FROM items ORDER BY embedding <~> '101' LIMIT 5;
-```
-
-Also supports Jaccard distance (`<%>`)
-
-## Binary Quantization
-
-Use expression indexing for binary quantization
-
-```sql
-CREATE INDEX ON items USING hnsw ((binary_quantize(embedding)::bit(3)) bit_hamming_ops);
-```
-
-Get the nearest neighbors by Hamming distance
-
-```sql
-SELECT * FROM items ORDER BY binary_quantize(embedding)::bit(3) <~> binary_quantize('[1,-2,3]') LIMIT 5;
-```
-
-Re-rank by the original vectors for better recall
-
-```sql
-SELECT * FROM (
-    SELECT * FROM items ORDER BY binary_quantize(embedding)::bit(3) <~> binary_quantize('[1,-2,3]') LIMIT 20
-) ORDER BY embedding <=> '[1,-2,3]' LIMIT 5;
-```
-
-## Sparse Vectors
-
-Use the `sparsevec` type to store sparse vectors
-
-```sql
-CREATE TABLE items (id bigserial PRIMARY KEY, embedding sparsevec(5));
-```
-
-Insert vectors
-
-```sql
-INSERT INTO items (embedding) VALUES ('{1:1,3:2,5:3}/5'), ('{1:4,3:5,5:6}/5');
-```
-
-The format is `{index1:value1,index2:value2}/dimensions` and indices start at 1 like SQL arrays
-
-Get the nearest neighbors by L2 distance
-
-```sql
-SELECT * FROM items ORDER BY embedding <-> '{1:3,3:1,5:2}/5' LIMIT 5;
-```
-
-## Hybrid Search
-
-Use together with Postgres [full-text search](https://www.postgresql.org/docs/current/textsearch-intro.html) for hybrid search.
-
-```sql
-SELECT id, content FROM items, plainto_tsquery('hello search') query
-    WHERE textsearch @@ query ORDER BY ts_rank_cd(textsearch, query) DESC LIMIT 5;
-```
-
-You can use [Reciprocal Rank Fusion](https://github.com/pgvector/pgvector-python/blob/master/examples/hybrid_search/rrf.py) or a [cross-encoder](https://github.com/pgvector/pgvector-python/blob/master/examples/hybrid_search/cross_encoder.py) to combine results.
-
-## Indexing Subvectors
-
-Use expression indexing to index subvectors
-
-```sql
-CREATE INDEX ON items USING hnsw ((subvector(embedding, 1, 3)::vector(3)) vector_cosine_ops);
-```
-
-Get the nearest neighbors by cosine distance
-
-```sql
-SELECT * FROM items ORDER BY subvector(embedding, 1, 3)::vector(3) <=> subvector('[1,2,3,4,5]'::vector, 1, 3) LIMIT 5;
-```
-
-Re-rank by the full vectors for better recall
-
-```sql
-SELECT * FROM (
-    SELECT * FROM items ORDER BY subvector(embedding, 1, 3)::vector(3) <=> subvector('[1,2,3,4,5]'::vector, 1, 3) LIMIT 20
-) ORDER BY embedding <=> '[1,2,3,4,5]' LIMIT 5;
-```
-
-## Performance
-
-### Tuning
-
-Use a tool like [PgTune](https://pgtune.leopard.in.ua/) to set initial values for Postgres server parameters. For instance, `shared_buffers` should typically be 25% of the server’s memory. You can find the config file with:
-
-```sql
-SHOW config_file;
-```
 
-And check individual settings with:
+-- 对比查询（先 off 再 on）
+SET enable_seqscan = off;
+SET hnsw.ef_search = 40;
 
-```sql
-SHOW shared_buffers;
-```
-
-Be sure to restart Postgres for changes to take effect.
-
-### Storing
-
-Use the `halfvec` type instead of `vector` for a smaller working set.
-
-### Loading
-
-Use `COPY` for bulk loading data ([example](https://github.com/pgvector/pgvector-python/blob/master/examples/loading/example.py)).
-
-```sql
-COPY items (embedding) FROM STDIN WITH (FORMAT BINARY);
-```
-
-Add any indexes *after* loading the initial data for best performance.
-
-### Indexing
-
-See index build time for [HNSW](#index-build-time) and [IVFFlat](#index-build-time-1).
-
-Use [binary quantization](#binary-quantization) for smaller indexes and faster build times at scale.
-
-In production environments, create indexes concurrently to avoid blocking writes.
-
-```sql
-CREATE INDEX CONCURRENTLY ...
-```
-
-### Querying
-
-Use `EXPLAIN (ANALYZE, BUFFERS)` to debug performance.
-
-```sql
-EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM items ORDER BY embedding <-> '[3,1,2]' LIMIT 5;
-```
-
-#### Exact Search
-
-To speed up queries without an index, increase `max_parallel_workers_per_gather`.
-
-```sql
-SET max_parallel_workers_per_gather = 4;
-```
-
-If vectors are normalized to length 1 (like [OpenAI embeddings](https://platform.openai.com/docs/guides/embeddings/which-distance-function-should-i-use)), use inner product for best performance.
-
-```tsql
-SELECT * FROM items ORDER BY embedding <#> '[3,1,2]' LIMIT 5;
-```
-
-#### Approximate Search
-
-Use [binary quantization](#binary-quantization) with re-ranking to keep indexes in-memory at scale.
-
-To speed up queries with an IVFFlat index, increase the number of inverted lists (at the expense of recall).
-
-```sql
-CREATE INDEX ON items USING ivfflat (embedding vector_l2_ops) WITH (lists = 1000);
-```
-
-### Vacuuming
-
-Vacuuming can take a while for HNSW indexes. Speed it up by reindexing first.
-
-```sql
-REINDEX INDEX CONCURRENTLY index_name;
-VACUUM table_name;
-```
-
-## Scaling
-
-For a smaller working set:
-
-1. Use the `halfvec` type instead of `vector` for tables
-2. Use [binary quantization](#binary-quantization) for indexes (with re-ranking for search)
-
-Scale vertically by increasing memory, CPU, and storage on a single instance. Use existing tools to [tune parameters](#tuning) and [monitor performance](#monitoring).
-
-Scale horizontally with [replicas](https://www.postgresql.org/docs/current/hot-standby.html), or use [Citus](https://github.com/citusdata/citus), [PgDog](https://github.com/pgdogdev/pgdog), or another approach for sharding ([example](https://github.com/pgvector/pgvector-python/blob/master/examples/citus/example.py)).
-
-## Monitoring
-
-Use existing tools like [pg_stat_statements](https://www.postgresql.org/docs/current/pgstatstatements.html) or [PgHero](https://github.com/ankane/pghero) to monitor performance.
-
-Monitor recall by comparing results from approximate search with exact search.
-
-```sql
-BEGIN;
-SET LOCAL enable_indexscan = off; -- use exact search
-SELECT ...
-COMMIT;
-```
-
-## Languages
-
-Use pgvector from any language with a Postgres client. You can even generate and store vectors in one language and query them in another.
-
-Language | Libraries / Examples
---- | ---
-Ada | [pgvector-ada](https://github.com/pgvector/pgvector-ada)
-Algol | [pgvector-algol](https://github.com/pgvector/pgvector-algol)
-C | [pgvector-c](https://github.com/pgvector/pgvector-c)
-C++ | [pgvector-cpp](https://github.com/pgvector/pgvector-cpp)
-C#, F#, Visual Basic | [pgvector-dotnet](https://github.com/pgvector/pgvector-dotnet)
-COBOL | [pgvector-cobol](https://github.com/pgvector/pgvector-cobol)
-Crystal | [pgvector-crystal](https://github.com/pgvector/pgvector-crystal)
-D | [pgvector-d](https://github.com/pgvector/pgvector-d)
-Dart | [pgvector-dart](https://github.com/pgvector/pgvector-dart)
-Elixir | [pgvector-elixir](https://github.com/pgvector/pgvector-elixir)
-Erlang | [pgvector-erlang](https://github.com/pgvector/pgvector-erlang)
-Fortran | [pgvector-fortran](https://github.com/pgvector/pgvector-fortran)
-Gleam | [pgvector-gleam](https://github.com/pgvector/pgvector-gleam)
-Go | [pgvector-go](https://github.com/pgvector/pgvector-go)
-Haskell | [pgvector-haskell](https://github.com/pgvector/pgvector-haskell)
-Java, Kotlin, Groovy, Scala | [pgvector-java](https://github.com/pgvector/pgvector-java)
-JavaScript, TypeScript | [pgvector-node](https://github.com/pgvector/pgvector-node)
-Julia | [Pgvector.jl](https://github.com/pgvector/Pgvector.jl)
-Lisp | [pgvector-lisp](https://github.com/pgvector/pgvector-lisp)
-Lua | [pgvector-lua](https://github.com/pgvector/pgvector-lua)
-Nim | [pgvector-nim](https://github.com/pgvector/pgvector-nim)
-OCaml | [pgvector-ocaml](https://github.com/pgvector/pgvector-ocaml)
-Pascal | [pgvector-pascal](https://github.com/pgvector/pgvector-pascal)
-Perl | [pgvector-perl](https://github.com/pgvector/pgvector-perl)
-PHP | [pgvector-php](https://github.com/pgvector/pgvector-php)
-Prolog | [pgvector-prolog](https://github.com/pgvector/pgvector-prolog)
-Python | [pgvector-python](https://github.com/pgvector/pgvector-python)
-R | [pgvector-r](https://github.com/pgvector/pgvector-r)
-Racket | [pgvector-racket](https://github.com/pgvector/pgvector-racket)
-Raku | [pgvector-raku](https://github.com/pgvector/pgvector-raku)
-Ruby | [pgvector-ruby](https://github.com/pgvector/pgvector-ruby), [Neighbor](https://github.com/ankane/neighbor)
-Rust | [pgvector-rust](https://github.com/pgvector/pgvector-rust)
-Swift | [pgvector-swift](https://github.com/pgvector/pgvector-swift)
-Tcl | [pgvector-tcl](https://github.com/pgvector/pgvector-tcl)
-Zig | [pgvector-zig](https://github.com/pgvector/pgvector-zig)
-
-## Frequently Asked Questions
-
-#### How many vectors can be stored in a single table?
-
-A non-partitioned table has a limit of 32 TB by default in Postgres. A partitioned table can have thousands of partitions of that size.
-
-#### Is replication supported?
-
-Yes, pgvector uses the write-ahead log (WAL), which allows for replication and point-in-time recovery.
-
-#### What if I want to index vectors with more than 2,000 dimensions?
-
-You can use [half-precision vectors](#half-precision-vectors) or [half-precision indexing](#half-precision-indexing) to index up to 4,000 dimensions or [binary quantization](#binary-quantization) to index up to 64,000 dimensions. Other options are [indexing subvectors](#indexing-subvectors) (for models that support it) or [dimensionality reduction](https://en.wikipedia.org/wiki/Dimensionality_reduction).
-
-#### Can I store vectors with different dimensions in the same column?
-
-You can use `vector` as the type (instead of `vector(n)`).
-
-```sql
-CREATE TABLE embeddings (model_id bigint, item_id bigint, embedding vector, PRIMARY KEY (model_id, item_id));
-```
-
-However, you can only create indexes on rows with the same number of dimensions (using [expression](https://www.postgresql.org/docs/current/indexes-expressional.html) and [partial](https://www.postgresql.org/docs/current/indexes-partial.html) indexing):
-
-```sql
-CREATE INDEX ON embeddings USING hnsw ((embedding::vector(3)) vector_l2_ops) WHERE (model_id = 123);
-```
-
-and query with:
-
-```sql
-SELECT * FROM embeddings WHERE model_id = 123 ORDER BY embedding::vector(3) <-> '[3,1,2]' LIMIT 5;
-```
-
-#### Can I store vectors with more precision?
-
-You can use the `double precision[]` or `numeric[]` type to store vectors with more precision.
-
-```sql
-CREATE TABLE items (id bigserial PRIMARY KEY, embedding double precision[]);
-
--- use {} instead of [] for Postgres arrays
-INSERT INTO items (embedding) VALUES ('{1,2,3}'), ('{4,5,6}');
-```
-
-Optionally, add a [check constraint](https://www.postgresql.org/docs/current/ddl-constraints.html) to ensure data can be converted to the `vector` type and has the expected dimensions.
-
-```sql
-ALTER TABLE items ADD CHECK (vector_dims(embedding::vector) = 3);
-```
-
-Use [expression indexing](https://www.postgresql.org/docs/current/indexes-expressional.html) to index (at a lower precision):
-
-```sql
-CREATE INDEX ON items USING hnsw ((embedding::vector(3)) vector_l2_ops);
-```
-
-and query with:
-
-```sql
-SELECT * FROM items ORDER BY embedding::vector(3) <-> '[3,1,2]' LIMIT 5;
-```
-
-#### Do indexes need to fit into memory?
-
-No, but like other index types, you’ll likely see better performance if they do. You can get the size of an index with:
-
-```sql
-SELECT pg_size_pretty(pg_relation_size('index_name'));
-```
-
-Use [half-precision indexing](#half-precision-indexing) or [binary quantization](#binary-quantization) for smaller indexes.
-
-## Troubleshooting
-
-#### Why isn’t a query using an index?
-
-The query needs to have an `ORDER BY` and `LIMIT`, and the `ORDER BY` must be the result of a distance operator (not an expression) in ascending order.
-
-```sql
--- index
-ORDER BY embedding <=> '[3,1,2]' LIMIT 5;
-
--- no index
-ORDER BY 1 - (embedding <=> '[3,1,2]') DESC LIMIT 5;
-```
-
-You can encourage the planner to use an index for a query with:
-
-```sql
-BEGIN;
-SET LOCAL enable_seqscan = off;
-SELECT ...
-COMMIT;
-```
-
-Also, if the table is small, a table scan may be faster.
-
-#### Why isn’t a query using a parallel table scan?
-
-The planner doesn’t consider [out-of-line storage](https://www.postgresql.org/docs/current/storage-toast.html) in cost estimates, which can make a serial scan look cheaper. You can reduce the cost of a parallel scan for a query with:
-
-```sql
-BEGIN;
-SET LOCAL min_parallel_table_scan_size = 1;
-SET LOCAL parallel_setup_cost = 1;
-SELECT ...
-COMMIT;
-```
-
-or choose to store vectors inline:
-
-```sql
-ALTER TABLE items ALTER COLUMN embedding SET STORAGE PLAIN;
-```
-
-#### Why are there less results for a query after adding an HNSW index?
-
-Results are limited by the size of the dynamic candidate list (`hnsw.ef_search`), which is 40 by default. There may be even less results due to dead tuples or filtering conditions in the query. Enabling [iterative index scans](#iterative-index-scans) can help address this.
-
-Also, note that `NULL` vectors are not indexed (as well as zero vectors for cosine distance).
-
-#### Why are there less results for a query after adding an IVFFlat index?
-
-The index was likely created with too little data for the number of lists. Drop the index until the table has more data.
-
-```sql
-DROP INDEX index_name;
-```
-
-Results can also be limited by the number of probes (`ivfflat.probes`). Enabling [iterative index scans](#iterative-index-scans) can address this.
-
-Also, note that `NULL` vectors are not indexed (as well as zero vectors for cosine distance).
-
-## Reference
-
-- [Vector](#vector-type)
-- [Halfvec](#halfvec-type)
-- [Bit](#bit-type)
-- [Sparsevec](#sparsevec-type)
-
-### Vector Type
-
-Each vector takes `4 * dimensions + 8` bytes of storage. Each element is a single-precision floating-point number (like the `real` type in Postgres), and all elements must be finite (no `NaN`, `Infinity` or `-Infinity`). Vectors can have up to 16,000 dimensions.
-
-### Vector Operators
-
-Operator | Description | Added
---- | --- | ---
-\+ | element-wise addition |
-\- | element-wise subtraction |
-\* | element-wise multiplication | 0.5.0
-\|\| | concatenate | 0.7.0
-<-> | Euclidean distance |
-<#> | negative inner product |
-<=> | cosine distance |
-<+> | taxicab distance | 0.7.0
+SET hnsw.hot_cold_enabled = off;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM items ORDER BY embedding <-> '[...]'::vector LIMIT 10;
 
-### Vector Functions
-
-Function | Description | Added
---- | --- | ---
-binary_quantize(vector) → bit | binary quantize | 0.7.0
-cosine_distance(vector, vector) → double precision | cosine distance |
-inner_product(vector, vector) → double precision | inner product |
-l1_distance(vector, vector) → double precision | taxicab distance | 0.5.0
-l2_distance(vector, vector) → double precision | Euclidean distance |
-l2_normalize(vector) → vector | Normalize with Euclidean norm | 0.7.0
-subvector(vector, integer, integer) → vector | subvector | 0.7.0
-vector_dims(vector) → integer | number of dimensions |
-vector_norm(vector) → double precision | Euclidean norm |
-
-### Vector Aggregate Functions
-
-Function | Description | Added
---- | --- | ---
-avg(vector) → vector | average |
-sum(vector) → vector | sum | 0.5.0
-
-### Halfvec Type
-
-Each half vector takes `2 * dimensions + 8` bytes of storage. Each element is a half-precision floating-point number, and all elements must be finite (no `NaN`, `Infinity` or `-Infinity`). Half vectors can have up to 16,000 dimensions.
-
-### Halfvec Operators
-
-Operator | Description | Added
---- | --- | ---
-\+ | element-wise addition | 0.7.0
-\- | element-wise subtraction | 0.7.0
-\* | element-wise multiplication | 0.7.0
-\|\| | concatenate | 0.7.0
-<-> | Euclidean distance | 0.7.0
-<#> | negative inner product | 0.7.0
-<=> | cosine distance | 0.7.0
-<+> | taxicab distance | 0.7.0
-
-### Halfvec Functions
-
-Function | Description | Added
---- | --- | ---
-binary_quantize(halfvec) → bit | binary quantize | 0.7.0
-cosine_distance(halfvec, halfvec) → double precision | cosine distance | 0.7.0
-inner_product(halfvec, halfvec) → double precision | inner product | 0.7.0
-l1_distance(halfvec, halfvec) → double precision | taxicab distance | 0.7.0
-l2_distance(halfvec, halfvec) → double precision | Euclidean distance | 0.7.0
-l2_norm(halfvec) → double precision | Euclidean norm | 0.7.0
-l2_normalize(halfvec) → halfvec | Normalize with Euclidean norm | 0.7.0
-subvector(halfvec, integer, integer) → halfvec | subvector | 0.7.0
-vector_dims(halfvec) → integer | number of dimensions | 0.7.0
-
-### Halfvec Aggregate Functions
-
-Function | Description | Added
---- | --- | ---
-avg(halfvec) → halfvec | average | 0.7.0
-sum(halfvec) → halfvec | sum | 0.7.0
-
-### Bit Type
-
-Each bit vector takes `dimensions / 8 + 8` bytes of storage. See the [Postgres docs](https://www.postgresql.org/docs/current/datatype-bit.html) for more info.
-
-### Bit Operators
-
-Operator | Description | Added
---- | --- | ---
-<~> | Hamming distance | 0.7.0
-<%> | Jaccard distance | 0.7.0
-
-### Bit Functions
-
-Function | Description | Added
---- | --- | ---
-hamming_distance(bit, bit) → double precision | Hamming distance | 0.7.0
-jaccard_distance(bit, bit) → double precision | Jaccard distance | 0.7.0
-
-### Sparsevec Type
-
-Each sparse vector takes `8 * non-zero elements + 16` bytes of storage. Each element is a single-precision floating-point number, and all elements must be finite (no `NaN`, `Infinity` or `-Infinity`). Sparse vectors can have up to 16,000 non-zero elements.
-
-### Sparsevec Operators
-
-Operator | Description | Added
---- | --- | ---
-<-> | Euclidean distance | 0.7.0
-<#> | negative inner product | 0.7.0
-<=> | cosine distance | 0.7.0
-<+> | taxicab distance | 0.7.0
-
-### Sparsevec Functions
-
-Function | Description | Added
---- | --- | ---
-cosine_distance(sparsevec, sparsevec) → double precision | cosine distance | 0.7.0
-inner_product(sparsevec, sparsevec) → double precision | inner product | 0.7.0
-l1_distance(sparsevec, sparsevec) → double precision | taxicab distance | 0.7.0
-l2_distance(sparsevec, sparsevec) → double precision | Euclidean distance | 0.7.0
-l2_norm(sparsevec) → double precision | Euclidean norm | 0.7.0
-l2_normalize(sparsevec) → sparsevec | Normalize with Euclidean norm | 0.7.0
-
-## Installation Notes - Linux and Mac
-
-### Postgres Location
-
-If your machine has multiple Postgres installations, specify the path to [pg_config](https://www.postgresql.org/docs/current/app-pgconfig.html) with:
-
-```sh
-export PG_CONFIG=/Library/PostgreSQL/18/bin/pg_config
-```
-
-Then re-run the installation instructions (run `make clean` before `make` if needed). If `sudo` is needed for `make install`, use:
-
-```sh
-sudo --preserve-env=PG_CONFIG make install
-```
-
-A few common paths on Mac are:
-
-- EDB installer - `/Library/PostgreSQL/18/bin/pg_config`
-- Homebrew (arm64) - `/opt/homebrew/opt/postgresql@18/bin/pg_config`
-- Homebrew (x86-64) - `/usr/local/opt/postgresql@18/bin/pg_config`
-
-Note: Replace `18` with your Postgres server version
-
-### Missing Header
-
-If compilation fails with `fatal error: postgres.h: No such file or directory`, make sure Postgres development files are installed on the server.
-
-For Ubuntu and Debian, use:
-
-```sh
-sudo apt install postgresql-server-dev-18
-```
-
-Note: Replace `18` with your Postgres server version
-
-### Missing SDK
-
-If compilation fails and the output includes `warning: no such sysroot directory` on Mac, your Postgres installation points to a path that no longer exists.
-
-```sh
-pg_config --cppflags
-```
-
-Reinstall Postgres to fix this.
-
-### Portability
-
-By default, pgvector compiles with `-march=native` on some platforms for best performance. However, this can lead to `Illegal instruction` errors if trying to run the compiled extension on a different machine.
-
-To compile for portability, use:
-
-```sh
-make OPTFLAGS=""
-```
-
-## Installation Notes - Windows
-
-### Missing Header
-
-If compilation fails with `Cannot open include file: 'postgres.h': No such file or directory`, make sure `PGROOT` is correct.
-
-### Mismatched Architecture
-
-If compilation fails with `error C2196: case value '4' already used`, make sure you’re using the `x64 Native Tools Command Prompt`. Then run `nmake /F Makefile.win clean` and re-run the installation instructions.
-
-### Missing Symbol
-
-If linking fails with `unresolved external symbol float_to_shortest_decimal_bufn` with Postgres 17.0-17.2, upgrade to Postgres 17.3+.
-
-### Permissions
-
-If installation fails with `Access is denied`, re-run the installation instructions as an administrator.
-
-## Additional Installation Methods
-
-### Docker
-
-Get the [Docker image](https://hub.docker.com/r/pgvector/pgvector) with:
-
-```sh
-docker pull pgvector/pgvector:pg18-trixie
-```
-
-This adds pgvector to the [Postgres image](https://hub.docker.com/_/postgres) (replace `18` with your Postgres server version, and run it the same way).
-
-Supported tags are:
-
-- `pg18-trixie`, `0.8.4-pg18-trixie`
-- `pg18-bookworm`, `0.8.4-pg18-bookworm`, `pg18`, `0.8.4-pg18`
-- `pg17-trixie`, `0.8.4-pg17-trixie`
-- `pg17-bookworm`, `0.8.4-pg17-bookworm`, `pg17`, `0.8.4-pg17`
-- `pg16-trixie`, `0.8.4-pg16-trixie`
-- `pg16-bookworm`, `0.8.4-pg16-bookworm`, `pg16`, `0.8.4-pg16`
-- `pg15-trixie`, `0.8.4-pg15-trixie`
-- `pg15-bookworm`, `0.8.4-pg15-bookworm`, `pg15`, `0.8.4-pg15`
-- `pg14-trixie`, `0.8.4-pg14-trixie`
-- `pg14-bookworm`, `0.8.4-pg14-bookworm`, `pg14`, `0.8.4-pg14`
-- `pg13-trixie`, `0.8.4-pg13-trixie`
-- `pg13-bookworm`, `0.8.4-pg13-bookworm`, `pg13`, `0.8.4-pg13`
-
-You can also build the image manually:
-
-```sh
-git clone --branch v0.8.4 https://github.com/pgvector/pgvector.git
-cd pgvector
-docker build --pull --build-arg PG_MAJOR=18 -t myuser/pgvector .
-```
-
-If you increase `maintenance_work_mem`, make sure `--shm-size` is at least that size to avoid an error with parallel HNSW index builds.
-
-```sh
-docker run --shm-size=1g ...
-```
-
-### Homebrew
-
-With Homebrew Postgres, you can use:
-
-```sh
-brew install pgvector
-```
-
-Note: This only adds it to the `postgresql@18` and `postgresql@17` formulas
-
-### PGXN
-
-Install from the [PostgreSQL Extension Network](https://pgxn.org/dist/vector) with:
-
-```sh
-pgxn install vector
-```
-
-### APT
-
-Debian and Ubuntu packages are available from the [PostgreSQL APT Repository](https://wiki.postgresql.org/wiki/Apt). Follow the [setup instructions](https://wiki.postgresql.org/wiki/Apt#Quickstart) and run:
-
-```sh
-sudo apt install postgresql-18-pgvector
+SET hnsw.hot_cold_enabled = on;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM items ORDER BY embedding <-> '[...]'::vector LIMIT 10;
 ```
-
-Note: Replace `18` with your Postgres server version
-
-### Yum
-
-RPM packages are available from the [PostgreSQL Yum Repository](https://yum.postgresql.org/). Follow the [setup instructions](https://www.postgresql.org/download/linux/redhat/) for your distribution and run:
 
-```sh
-sudo yum install pgvector_18
-# or
-sudo dnf install pgvector_18
-```
+观察 `Execution Time` 和 `Buffers: shared hit/read` 差异。
 
-Note: Replace `18` with your Postgres server version
+---
 
-### pkg
+## Benchmark 复现
 
-Install the FreeBSD package with:
+完整 benchmark 脚手架位于 `test/hot_cold/bench/`：
 
-```sh
-pkg install postgresql17-pgvector
-```
+```powershell
+# 1) 建 200k 行数据集 + ground truth（约 3-5 分钟）
+$env:PGPASSWORD = "your_password"
+& psql -U postgres -d postgres -X -q -P pager=off `
+    --set=n_rows=200000 --set=dim=128 --set=n_queries=50 `
+    --set=top_k=10 --set=hnsw_m=16 --set=hnsw_efc=64 `
+    -f test/hot_cold/bench/setup.sql
 
-or the port with:
+# 2) 跑单配置（off / on 各一次）
+& psql -U postgres -d postgres -X -q -P pager=off `
+    --set=top_k=10 --set=ef_search=200 --set=hot_cold=off `
+    --set=hot_layer=2 --set=prefetch_neighbors=16 --set=warmup=1 `
+    -f test/hot_cold/bench/run_one.sql
 
-```sh
-cd /usr/ports/databases/pgvector
-make install
+& psql -U postgres -d postgres -X -q -P pager=off `
+    --set=top_k=10 --set=ef_search=200 --set=hot_cold=on `
+    --set=hot_layer=2 --set=prefetch_neighbors=16 --set=warmup=1 `
+    -f test/hot_cold/bench/run_one.sql
 ```
-
-### APK
 
-Install the Alpine package with:
+完整报告见 `DOC/优化/benchmark_report.md`。
 
-```sh
-apk add postgresql-pgvector
-```
-
-### conda-forge
+---
 
-With Conda Postgres, install from [conda-forge](https://anaconda.org/conda-forge/pgvector) with:
+## 项目结构
 
-```sh
-conda install -c conda-forge pgvector
 ```
-
-This method is [community-maintained](https://github.com/conda-forge/pgvector-feedstock) by [@mmcauliffe](https://github.com/mmcauliffe)
-
-### Postgres.app
-
-Download the [latest release](https://postgresapp.com/downloads.html) with Postgres 15+.
-
-## Hosted Postgres
-
-pgvector is available on [these providers](https://github.com/pgvector/pgvector/issues/54).
-
-## Upgrading
-
-[Install](#installation) the latest version (use the same method as the original installation). Then in each database you want to upgrade, run:
-
-```sql
-ALTER EXTENSION vector UPDATE;
+pgvector-hnsw-hotcold/
+├── src/
+│   ├── hnsw.h                  # Phase 1+2 GUC 声明
+│   ├── hnsw.c                  # GUC 注册
+│   ├── hnswutils.c             # Phase 1 prefetch 核心逻辑
+│   └── hnswscan.c              # Phase 2 动态 ef_search
+├── test/hot_cold/
+│   ├── 001_hot_cold_smoke.pl   # GUC 存在性测试
+│   ├── 002_hot_cold_recall.pl  # Recall@10 回归测试
+│   └── bench/
+│       ├── setup.sql           # 数据集 + ground truth
+│       ├── run_one.sql         # 单配置 recall + latency
+│       ├── probe_build.sql     # Phase 3 构建期观测
+│       └── probe_parallel_build.sql  # Phase 4 并行观测
+├── DOC/
+│   ├── 优化/
+│   │   ├── 优化方向.md         # Phase 1-4 设计文档
+│   │   ├── benchmark_report.md # 实验数据与结论
+│   │   └── pgvector优化实现文件导览.md
+│   └── 项目结构/
+│       └── pgvector_14day_reading_plan.md  # 源码学习路线
+└── README.md                   # 本文件
 ```
 
-You can check the version in the current database with:
+---
 
-```sql
-SELECT extversion FROM pg_extension WHERE extname = 'vector';
-```
+## 技术细节
 
-## Thanks
+### 为什么不自建热缓存？
 
-Thanks to:
+PostgreSQL 已有成熟的 Buffer Pool。自建缓存会遇到：
+- 缓存生命周期管理（何时失效？）
+- VACUUM 后数据一致性
+- 并发查询的隔离
+- 内存上限控制与 OOM 风险
 
-- [PASE: PostgreSQL Ultra-High-Dimensional Approximate Nearest Neighbor Search Extension](https://dl.acm.org/doi/pdf/10.1145/3318464.3386131)
-- [Faiss: A Library for Efficient Similarity Search and Clustering of Dense Vectors](https://github.com/facebookresearch/faiss)
-- [Using the Triangle Inequality to Accelerate k-means](https://cdn.aaai.org/ICML/2003/ICML03-022.pdf)
-- [k-means++: The Advantage of Careful Seeding](https://theory.stanford.edu/~sergei/papers/kMeansPP-soda.pdf)
-- [Concept Decompositions for Large Sparse Text Data using Clustering](https://www.cs.utexas.edu/users/inderjit/public_papers/concept_mlj.pdf)
-- [Efficient and Robust Approximate Nearest Neighbor Search using Hierarchical Navigable Small World Graphs](https://arxiv.org/ftp/arxiv/papers/1603/1603.09320.pdf)
+`PrefetchBuffer` 的优势：
+- 复用 PG 原生 Buffer Pool，零额外内存开销
+- 不改变数据结构和搜索结果
+- 容易灰度（GUC 开关）
+- 可通过 `EXPLAIN (BUFFERS)` 直接验证效果
 
-## History
+### 为什么 Phase 3/4 不改代码？
 
-View the [changelog](https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md)
+**Phase 3**：观测显示 build 期瓶颈是 CPU，`reads=2` 说明几乎无 I/O。盲目加 prefetch 无收益。
 
-## Contributing
+**Phase 4**：20k 行下并行加速比已达 2.13x，wait_event 为空说明无锁竞争。只有在大规模 + 内存不足时才可能出现锁热点，那时再用观测脚本定位具体 LWLock 位置。
 
-Everyone is encouraged to help improve this project. Here are a few ways you can help:
+**原则**：观测先行，数据驱动优化，避免过早优化。
 
-- [Report bugs](https://github.com/pgvector/pgvector/issues)
-- Fix bugs and [submit pull requests](https://github.com/pgvector/pgvector/pulls)
-- Write, clarify, or fix documentation
-- Suggest or add new features
+---
 
-To get started with development:
+## 局限与未来工作
 
-```sh
-git clone https://github.com/pgvector/pgvector.git
-cd pgvector
-make
-make install
-```
+### 当前局限
 
-To run all tests:
+1. **数据集特性**：128 维随机向量对 HNSW 不友好，Recall 偏低反映数据特性而非优化问题。真实 embedding（如 text-embedding-ada-002 输出）召回率会更高。
+2. **单机测试**：未覆盖分布式场景（Citus / PgDog 等分片方案）。
+3. **Windows 时钟精度**：~0.5ms jitter，大规模统计时需多轮平均。
+4. **未测 SSD vs HDD**：prefetch 在机械盘上收益可能更大。
 
-```sh
-make installcheck        # regression tests
-make prove_installcheck  # TAP tests
-```
+### Roadmap
 
-To run single tests:
+- [ ] 支持真实 embedding 数据集（SIFT1M / GIST1M / OpenAI embeddings）
+- [ ] 加入 `hot_layer` sweep，找最优默认值
+- [ ] `ef_search_multiplier` 参数敏感性分析
+- [ ] 冷启动实验（`pg_prewarm` + `pg_buffercache` 观测）
+- [ ] 与 Milvus / Weaviate / Qdrant 的 ANN 查询延迟对比
+- [ ] 贡献回 pgvector 上游（如果社区接受 prefetch 思路）
 
-```sh
-make installcheck REGRESS=functions                            # regression test
-make prove_installcheck PROVE_TESTS=test/t/001_ivfflat_wal.pl  # TAP test
-```
+---
 
-To enable assertions:
+## 参考资料
 
-```sh
-make clean && PG_CFLAGS="-DUSE_ASSERT_CHECKING" make && make install
-```
+- [pgvector 官方仓库](https://github.com/pgvector/pgvector)
+- [HNSW 论文](https://arxiv.org/abs/1603.09320)：Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs
+- [PostgreSQL Index AM 文档](https://www.postgresql.org/docs/current/indexam.html)
+- [Buffer Pool 预取研究](https://www.postgresql.org/message-id/flat/20200820165220.GA9984%40alvherre.pgsql)
 
-To enable benchmarking:
+---
 
-```sh
-make clean && PG_CFLAGS="-DHNSW_BENCH -DIVFFLAT_BENCH" make && make install
-```
+## 致谢
 
-To show memory usage:
+本项目基于 [pgvector 0.8.4](https://github.com/pgvector/pgvector/releases/tag/v0.8.4)，感谢 Andrew Kane 和所有贡献者的工作。
 
-```sh
-make clean && PG_CFLAGS="-DHNSW_MEMORY -DIVFFLAT_MEMORY" make && make install
-```
+---
 
-To get k-means metrics:
+## License
 
-```sh
-make clean && PG_CFLAGS="-DIVFFLAT_KMEANS_DEBUG" make && make install
-```
+MIT License（与 pgvector 上游保持一致）
 
-Resources for contributors
+Copyright (c) 2024 pgvector contributors  
+Copyright (c) 2024 本项目作者
 
-- [Extension Building Infrastructure](https://www.postgresql.org/docs/current/extend-pgxs.html)
-- [Index Access Method Interface Definition](https://www.postgresql.org/docs/current/indexam.html)
-- [Generic WAL Records](https://www.postgresql.org/docs/current/generic-wal.html)
+Permission is hereby granted, free of charge, to any person obtaining a copy...
