@@ -153,6 +153,10 @@ extern int	hnsw_prefetch_neighbors;
 extern bool hnsw_ef_search_auto;
 extern double hnsw_ef_search_multiplier;
 
+/* Adaptive prefetch + entry prewarm (Phase 5) */
+extern bool hnsw_prefetch_adaptive;
+extern bool hnsw_prewarm_entry;
+
 typedef enum HnswIterativeScanMode
 {
 	HNSW_ITERATIVE_SCAN_OFF,

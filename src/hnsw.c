@@ -48,6 +48,10 @@ int			hnsw_prefetch_neighbors = 16;
 bool		hnsw_ef_search_auto = false;
 double		hnsw_ef_search_multiplier = 2.0;
 
+/* Adaptive prefetch + entry prewarm (Phase 5) */
+bool		hnsw_prefetch_adaptive = false;
+bool		hnsw_prewarm_entry = false;
+
 static relopt_kind hnsw_relopt_kind;
 
 /*
@@ -167,6 +171,24 @@ HnswInit(void)
 							 "Batch size = base ef_search * multiplier^(resume_count). Clamped to max_ef_search.",
 							 &hnsw_ef_search_multiplier,
 							 2.0, 1.0, 10.0, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * Phase 5: Adaptive prefetch depth + entry point prewarm.
+	 *
+	 * These further refine Phase 1 by adapting prefetch aggressiveness to
+	 * ef_search and prewarmming the query entry path.
+	 */
+	DefineCustomBoolVariable("hnsw.prefetch_adaptive",
+							 "Enable adaptive prefetch depth based on ef_search",
+							 "When on, prefetch_count = min(unvisited, max(prefetch_neighbors, ef_search/4)).",
+							 &hnsw_prefetch_adaptive,
+							 false, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("hnsw.prewarm_entry",
+							 "Prefetch entry point and meta page at scan start",
+							 "Reduces first-query latency by preloading the entry path.",
+							 &hnsw_prewarm_entry,
+							 false, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("hnsw");
 }

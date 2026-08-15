@@ -44,6 +44,15 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	if (entryPoint == NULL)
 		return NIL;
 
+	/*
+	 * Phase 5: prewarm the entry point page. The very first neighbor load
+	 * happens immediately after this, so async-prefetching the entry block
+	 * shaves off the first buffer miss on cold starts.
+	 */
+	if (hnsw_hot_cold_enabled && hnsw_prewarm_entry &&
+		entryPoint->blkno != InvalidBlockNumber)
+		PrefetchBuffer(index, MAIN_FORKNUM, entryPoint->blkno);
+
 	ep = list_make1(HnswEntryCandidate(base, entryPoint, q, index, support, false));
 
 	for (int lc = entryPoint->level; lc >= 1; lc--)

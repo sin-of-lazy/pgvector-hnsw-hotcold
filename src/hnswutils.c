@@ -902,7 +902,20 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		/* Hot/cold prefetch: issue asynchronous I/O hints for neighbor pages */
 		if (!inMemory && hnsw_hot_cold_enabled && hnsw_prefetch_neighbors > 0)
 		{
-			int			prefetchCount = Min(unvisitedLength, hnsw_prefetch_neighbors);
+			int			baseDepth = hnsw_prefetch_neighbors;
+
+			/*
+			 * Phase 5: adaptive prefetch depth. Larger ef means more neighbors
+			 * will be visited, so scale prefetch depth accordingly. Cap at 2m
+			 * (the physical maximum of ground-layer neighbors).
+			 */
+			if (hnsw_prefetch_adaptive)
+			{
+				int			adaptive = Max(baseDepth, ef / 4);
+				baseDepth = Min(adaptive, HNSW_MAX_M * 2);
+			}
+
+			int			prefetchCount = Min(unvisitedLength, baseDepth);
 
 			if (lc < hnsw_hot_layer)
 				prefetchCount = Min(prefetchCount, 4);
