@@ -113,6 +113,36 @@ so->resumeCount++;
 
 ---
 
+### Phase 5: 自适应预取深度与入口点预热（v1.1.0）
+
+**Phase 5a - Adaptive Prefetch Depth（自适应预取深度）**
+
+Phase 1 的 `prefetch_neighbors=16` 是静态的。理论上 `ef_search` 越大，每次迭代访问的邻居越多，预取深度也应该更大。
+
+**改进**：新增 `hnsw.prefetch_adaptive` GUC，开启后按 `min(2m, max(prefetch_neighbors, ef_search / 4))` 动态计算预取深度。
+
+**Phase 5b - Entry Point Prewarm（入口点预热）**
+
+查询开始时 HNSW 会先访问 entry point。这是每次查询的必经路径，可以在 `GetScanItems` 拿到 entry point 后立即 prefetch，减少冷启动首次 buffer miss。
+
+**代码落点**：
+- `src/hnswutils.c:906-918`：adaptive depth 计算
+- `src/hnswscan.c:46-52`：entry point prefetch
+
+**新增 GUC**
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `hnsw.prefetch_adaptive` | bool | `off` | 根据 ef_search 自适应调整预取深度 |
+| `hnsw.prewarm_entry` | bool | `off` | 查询开始前预热 entry point block |
+
+**设计依据**：
+
+- ef_search=200 时 adaptive depth = max(16, 200/4) = 50，比固定 16 更积极
+- entry prewarm 主要收益在冷启动或大索引（>内存）场景
+
+---
+
 ### Phase 3: HNSW 构建期 I/O 观测
 
 **目标**：量化 `CREATE INDEX ... USING hnsw` 的耗时来源，判断是否需要 build-time prefetch。
