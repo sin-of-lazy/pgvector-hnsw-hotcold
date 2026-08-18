@@ -1,7 +1,79 @@
 # pgvector HNSW 查询与构建优化
 
+[![Build](https://github.com/sin-of-lazy/pgvector-hnsw-hotcold/actions/workflows/build.yml/badge.svg)](https://github.com/sin-of-lazy/pgvector-hnsw-hotcold/actions)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-13%2B-336791?logo=postgresql)](https://www.postgresql.org/)
+[![pgvector](https://img.shields.io/badge/pgvector-0.8.4-blue)](https://github.com/pgvector/pgvector)
+[![License](https://img.shields.io/badge/License-PostgreSQL-336791)](./LICENSE)
+
 > **面向 AI Infra / RAG 在线检索场景的 PostgreSQL pgvector 向量索引优化项目**  
 > 基于 pgvector 0.8.4，针对 HNSW 索引的查询路径、动态参数调优、构建期性能和并行扩展进行优化与验证。
+
+---
+
+## 核心成果一览
+
+```
+200k 行 128 维向量，ef_search=200：
+
+    p99 latency:  48.09 ms  ─────>  21.23 ms   (-55.9%)
+    avg latency:  22.95 ms  ─────>  15.42 ms   (-32.8%)
+    Recall@10:    0.478     ─────>  0.478      (完全一致)
+
+    代码改动: ~150 行     磁盘格式: 零改动     可灰度: 8 个 GUC
+```
+
+## 优化架构
+
+```mermaid
+flowchart TB
+    SQL["`**用户 SQL**
+    SELECT ... ORDER BY embedding <-> q LIMIT k`"]
+    Planner["`**PostgreSQL Planner**
+    识别 <-> 操作符 + LIMIT
+    选择 HNSW Index Scan`"]
+
+    subgraph Executor["Executor 层"]
+        Begin["hnswbeginscan()"]
+        Get["`hnswgettuple()
+        触发 GetScanItems`"]
+    end
+
+    subgraph HNSW["HNSW 查询核心 (src/hnswutils.c, hnswscan.c)"]
+        direction TB
+        Entry["`**Entry Point**
+        Layer 3, 1 node
+        ✨ Phase 5b: prewarm`"]
+        L2["Layer 2: ef=1 贪心导航"]
+        L1["Layer 1: ef=1 贪心导航"]
+        L0["`**Layer 0**: ef=ef_search beam search
+        ✨ Phase 1: PrefetchBuffer 邻居页
+        ✨ Phase 5a: adaptive depth`"]
+        Resume["`**iterative scan resume**
+        ✨ Phase 2: batch × multiplier`"]
+
+        Entry --> L2 --> L1 --> L0
+        L0 -.->|discarded 候选| Resume
+        Resume -.-> L0
+    end
+
+    Buffer["`**PostgreSQL Buffer Pool**
+    共享内存，8KB 页
+    LRU 淘汰`"]
+
+    SQL --> Planner --> Executor
+    Executor --> HNSW
+    HNSW <-->|"`PrefetchBuffer / ReadBuffer`"| Buffer
+
+    style Entry fill:#fef3c7
+    style L0 fill:#fef3c7
+    style Resume fill:#fef3c7
+    style Buffer fill:#dbeafe
+```
+
+**图例说明**：
+- 🟨 黄色节点：本项目新增或改造的路径（Phase 1/2/5）
+- 🟦 蓝色节点：PostgreSQL 原生 Buffer Pool（我们复用而非重建）
+- 虚线：iterative scan 的 resume 循环
 
 ---
 
@@ -194,6 +266,32 @@ Phase 1 的 `prefetch_neighbors=16` 是静态的。理论上 `ef_search` 越大�
 | 编译器（Windows） | Visual Studio 2017+ (MSVC) with C++ |
 | 编译器（Linux/macOS） | GCC/Clang + PostgreSQL dev headers |
 | pgvector | 基于 0.8.4 |
+
+---
+
+## 30 秒理解优化效果
+
+**场景**：200k 向量，查询 Top-10 最近邻
+
+```sql
+-- ❌ 官方 pgvector 0.8.4（未开启优化）
+SET hnsw.hot_cold_enabled = off;
+SELECT * FROM items ORDER BY embedding <-> query_vector LIMIT 10;
+-- 结果：avg 22.95ms, p99 48.09ms
+
+-- ✅ 本项目优化（Phase 1: Buffer Pool 预取）
+SET hnsw.hot_cold_enabled = on;
+SET hnsw.prefetch_neighbors = 16;
+SELECT * FROM items ORDER BY embedding <-> query_vector LIMIT 10;
+-- 结果：avg 15.42ms (-32.8%), p99 21.23ms (-55.9%)
+
+-- ✅ Phase 5: 自适应预取（高 ef_search 场景更激进）
+SET hnsw.prefetch_adaptive = on;   -- depth 自动扩展到 50（原 16）
+SET hnsw.prewarm_entry = on;        -- 冷启动预热入口点
+-- 收益：冷启动/大索引场景下首次查询延迟再降 10-15%
+```
+
+**关键**：Recall@10 完全一致（0.478），只改 I/O，不改搜索结果。
 
 ---
 
