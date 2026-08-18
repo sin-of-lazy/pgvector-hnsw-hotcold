@@ -903,6 +903,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		if (!inMemory && hnsw_hot_cold_enabled && hnsw_prefetch_neighbors > 0)
 		{
 			int			baseDepth = hnsw_prefetch_neighbors;
+			int			prefetchCount;
+			int			pi;
 
 			/*
 			 * Phase 5: adaptive prefetch depth. Larger ef means more neighbors
@@ -912,15 +914,16 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			if (hnsw_prefetch_adaptive)
 			{
 				int			adaptive = Max(baseDepth, ef / 4);
+
 				baseDepth = Min(adaptive, HNSW_MAX_M * 2);
 			}
 
-			int			prefetchCount = Min(unvisitedLength, baseDepth);
+			prefetchCount = Min(unvisitedLength, baseDepth);
 
 			if (lc < hnsw_hot_layer)
 				prefetchCount = Min(prefetchCount, 4);
 
-			for (int pi = 0; pi < prefetchCount; pi++)
+			for (pi = 0; pi < prefetchCount; pi++)
 			{
 				BlockNumber blk = ItemPointerGetBlockNumber(&unvisited[pi].indextid);
 
