@@ -22,6 +22,37 @@
     代码改动: ~150 行     磁盘格式: 零改动     可灰度: 8 个 GUC
 ```
 
+### 性能对比图表
+
+**200k 行数据集（大规模，索引超出内存）**
+
+<p align="center">
+  <img src="DOC/优化/images/latency_200k.svg" alt="200k延迟对比" width="80%"/>
+</p>
+
+<p align="center">
+  <img src="DOC/优化/images/improvement_200k.svg" alt="200k改善百分比" width="60%"/>
+</p>
+
+**关键观察**：ef_search=200 + p99 改善最显著（-55.9%），说明高 ef 场景下 I/O 是主要瓶颈，prefetch 直击痛点。
+
+<details>
+<summary>50k 行数据集（小规模，索引全在内存）</summary>
+
+<p align="center">
+  <img src="DOC/优化/images/latency_50k.svg" alt="50k延迟对比" width="80%"/>
+</p>
+
+<p align="center">
+  <img src="DOC/优化/images/improvement_50k.svg" alt="50k改善百分比" width="60%"/>
+</p>
+
+小数据集收益主要体现在尾延迟（p95 -24.6%），avg 改善有限（-9.6%）。
+
+</details>
+
+---
+
 ## 优化架构
 
 ```mermaid

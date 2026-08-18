@@ -1,0 +1,169 @@
+<svg width="800" height="500" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .title { font: bold 18px sans-serif; }
+      .axis-label { font: 14px sans-serif; }
+      .tick-label { font: 12px sans-serif; }
+      .legend-text { font: 12px sans-serif; }
+      .bar-label { font: 11px sans-serif; fill: white; }
+    </style>
+  </defs>
+  
+  <!-- Background -->
+  <rect width="800" height="500" fill="white"/>
+  
+  <!-- Title -->
+  <text x="400.0" y="30" text-anchor="middle" class="title">
+    50k 行数据集 延迟对比 (off vs on)
+  </text>
+  
+  <!-- Y axis -->
+  <line x1="80" y1="60" 
+        x2="80" y2="420" 
+        stroke="#999" stroke-width="2"/>
+  <text x="30" y="50" class="axis-label">延迟 (ms)</text>
+
+  <line x1="75" y1="420.0" 
+        x2="80" y2="420.0" stroke="#999" stroke-width="1"/>
+  <text x="70" y="424.0" text-anchor="end" class="tick-label">0</text>
+  <line x1="80" y1="420.0" 
+        x2="760" y2="420.0" 
+        stroke="#eee" stroke-width="1" stroke-dasharray="3,3"/>
+
+  <line x1="75" y1="348.0" 
+        x2="80" y2="348.0" stroke="#999" stroke-width="1"/>
+  <text x="70" y="352.0" text-anchor="end" class="tick-label">2</text>
+  <line x1="80" y1="348.0" 
+        x2="760" y2="348.0" 
+        stroke="#eee" stroke-width="1" stroke-dasharray="3,3"/>
+
+  <line x1="75" y1="276.0" 
+        x2="80" y2="276.0" stroke="#999" stroke-width="1"/>
+  <text x="70" y="280.0" text-anchor="end" class="tick-label">4</text>
+  <line x1="80" y1="276.0" 
+        x2="760" y2="276.0" 
+        stroke="#eee" stroke-width="1" stroke-dasharray="3,3"/>
+
+  <line x1="75" y1="204.0" 
+        x2="80" y2="204.0" stroke="#999" stroke-width="1"/>
+  <text x="70" y="208.0" text-anchor="end" class="tick-label">6</text>
+  <line x1="80" y1="204.0" 
+        x2="760" y2="204.0" 
+        stroke="#eee" stroke-width="1" stroke-dasharray="3,3"/>
+
+  <line x1="75" y1="132.0" 
+        x2="80" y2="132.0" stroke="#999" stroke-width="1"/>
+  <text x="70" y="136.0" text-anchor="end" class="tick-label">8</text>
+  <line x1="80" y1="132.0" 
+        x2="760" y2="132.0" 
+        stroke="#eee" stroke-width="1" stroke-dasharray="3,3"/>
+
+  <line x1="75" y1="60.0" 
+        x2="80" y2="60.0" stroke="#999" stroke-width="1"/>
+  <text x="70" y="64.0" text-anchor="end" class="tick-label">10</text>
+  <line x1="80" y1="60.0" 
+        x2="760" y2="60.0" 
+        stroke="#eee" stroke-width="1" stroke-dasharray="3,3"/>
+
+  <line x1="80" y1="420" 
+        x2="760" y2="420" 
+        stroke="#999" stroke-width="2"/>
+
+  <rect x="83.96666666666667" y="357.9" width="31.733333333333334" height="62.10000000000001" 
+        fill="#ef4444" opacity="0.9"/>
+  <text x="99.83333333333334" y="352.9" text-anchor="middle" class="bar-label" 
+        fill="#ef4444" font-weight="bold">1.7</text>
+
+  <rect x="123.63333333333333" y="363.876" width="31.733333333333334" height="56.123999999999995" 
+        fill="#10b981" opacity="0.9"/>
+  <text x="139.5" y="358.876" text-anchor="middle" class="bar-label" 
+        fill="#10b981" font-weight="bold">1.6</text>
+
+  <text x="119.66666666666666" y="440" 
+        text-anchor="middle" class="tick-label">ef=40</text>
+  <text x="119.66666666666666" y="460" 
+        text-anchor="middle" class="tick-label" font-weight="bold">avg</text>
+
+  <rect x="197.29999999999998" y="325.644" width="31.733333333333334" height="94.356" 
+        fill="#ef4444" opacity="0.9"/>
+  <text x="213.16666666666666" y="320.644" text-anchor="middle" class="bar-label" 
+        fill="#ef4444" font-weight="bold">2.6</text>
+
+  <rect x="236.96666666666664" y="348.86400000000003" width="31.733333333333334" height="71.136" 
+        fill="#10b981" opacity="0.9"/>
+  <text x="252.83333333333331" y="343.86400000000003" text-anchor="middle" class="bar-label" 
+        fill="#10b981" font-weight="bold">2.0</text>
+
+  <text x="232.99999999999997" y="440" 
+        text-anchor="middle" class="tick-label">ef=40</text>
+  <text x="232.99999999999997" y="460" 
+        text-anchor="middle" class="tick-label" font-weight="bold">p95</text>
+
+  <rect x="310.63333333333327" y="318.228" width="31.733333333333334" height="101.772" 
+        fill="#ef4444" opacity="0.9"/>
+  <text x="326.49999999999994" y="313.228" text-anchor="middle" class="bar-label" 
+        fill="#ef4444" font-weight="bold">2.8</text>
+
+  <rect x="350.29999999999995" y="331.08" width="31.733333333333334" height="88.92000000000002" 
+        fill="#10b981" opacity="0.9"/>
+  <text x="366.16666666666663" y="326.08" text-anchor="middle" class="bar-label" 
+        fill="#10b981" font-weight="bold">2.5</text>
+
+  <text x="346.3333333333333" y="440" 
+        text-anchor="middle" class="tick-label">ef=40</text>
+  <text x="346.3333333333333" y="460" 
+        text-anchor="middle" class="tick-label" font-weight="bold">p99</text>
+
+  <rect x="423.96666666666664" y="249.864" width="31.733333333333334" height="170.136" 
+        fill="#ef4444" opacity="0.9"/>
+  <text x="439.8333333333333" y="244.864" text-anchor="middle" class="bar-label" 
+        fill="#ef4444" font-weight="bold">4.7</text>
+
+  <rect x="463.6333333333333" y="250.26000000000002" width="31.733333333333334" height="169.73999999999998" 
+        fill="#10b981" opacity="0.9"/>
+  <text x="479.5" y="245.26000000000002" text-anchor="middle" class="bar-label" 
+        fill="#10b981" font-weight="bold">4.7</text>
+
+  <text x="459.6666666666667" y="440" 
+        text-anchor="middle" class="tick-label">ef=200</text>
+  <text x="459.6666666666667" y="460" 
+        text-anchor="middle" class="tick-label" font-weight="bold">avg</text>
+
+  <rect x="537.3" y="183.58799999999997" width="31.733333333333334" height="236.41200000000003" 
+        fill="#ef4444" opacity="0.9"/>
+  <text x="553.1666666666666" y="178.58799999999997" text-anchor="middle" class="bar-label" 
+        fill="#ef4444" font-weight="bold">6.6</text>
+
+  <rect x="576.9666666666666" y="210.12" width="31.733333333333334" height="209.88" 
+        fill="#10b981" opacity="0.9"/>
+  <text x="592.8333333333333" y="205.12" text-anchor="middle" class="bar-label" 
+        fill="#10b981" font-weight="bold">5.8</text>
+
+  <text x="572.9999999999999" y="440" 
+        text-anchor="middle" class="tick-label">ef=200</text>
+  <text x="572.9999999999999" y="460" 
+        text-anchor="middle" class="tick-label" font-weight="bold">p95</text>
+
+  <rect x="650.6333333333333" y="146.976" width="31.733333333333334" height="273.024" 
+        fill="#ef4444" opacity="0.9"/>
+  <text x="666.5" y="141.976" text-anchor="middle" class="bar-label" 
+        fill="#ef4444" font-weight="bold">7.6</text>
+
+  <rect x="690.3" y="171.92399999999998" width="31.733333333333334" height="248.07600000000002" 
+        fill="#10b981" opacity="0.9"/>
+  <text x="706.1666666666666" y="166.92399999999998" text-anchor="middle" class="bar-label" 
+        fill="#10b981" font-weight="bold">6.9</text>
+
+  <text x="686.3333333333333" y="440" 
+        text-anchor="middle" class="tick-label">ef=200</text>
+  <text x="686.3333333333333" y="460" 
+        text-anchor="middle" class="tick-label" font-weight="bold">p99</text>
+
+  <rect x="640" y="80" width="110" height="60" 
+        fill="white" stroke="#ccc" stroke-width="1" rx="3"/>
+  <rect x="650" y="95" width="20" height="15" fill="#ef4444"/>
+  <text x="675" y="107" class="legend-text">off (官方)</text>
+  <rect x="650" y="115" width="20" height="15" fill="#10b981"/>
+  <text x="675" y="127" class="legend-text">on (优化)</text>
+
+</svg>

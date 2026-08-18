@@ -1,0 +1,68 @@
+<svg width="600" height="400" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .title { font: bold 16px sans-serif; }
+      .bar-label-left { font: 12px sans-serif; text-anchor: end; }
+      .bar-label-right { font: bold 12px sans-serif; fill: white; }
+    </style>
+  </defs>
+  
+  <rect width="600" height="400" fill="white"/>
+  
+  <text x="300.0" y="30" text-anchor="middle" class="title">
+    200k 行 延迟改善百分比
+  </text>
+  
+  <line x1="100" y1="60" 
+        x2="100" y2="340" 
+        stroke="#999" stroke-width="2"/>
+
+  <text x="90" y="87.33333333333333" class="bar-label-left">
+    ef=40 avg
+  </text>
+  <rect x="100" y="67.0" width="202.8025412439799" height="32.666666666666664" 
+        fill="#3b82f6" opacity="0.9"/>
+  <text x="312.80254124397993" y="87.33333333333333" 
+        class="bar-label-right" fill="#3b82f6">-26.5%</text>
+
+  <text x="90" y="134.0" class="bar-label-left">
+    ef=40 p95
+  </text>
+  <rect x="100" y="113.66666666666666" width="195.22832036876983" height="32.666666666666664" 
+        fill="#3b82f6" opacity="0.9"/>
+  <text x="305.2283203687698" y="134.0" 
+        class="bar-label-right" fill="#3b82f6">-25.5%</text>
+
+  <text x="90" y="180.66666666666666" class="bar-label-left">
+    ef=40 p99
+  </text>
+  <rect x="100" y="160.33333333333331" width="128.28462073764783" height="32.666666666666664" 
+        fill="#3b82f6" opacity="0.9"/>
+  <text x="238.28462073764783" y="180.66666666666666" 
+        class="bar-label-right" fill="#3b82f6">-16.7%</text>
+
+  <text x="90" y="227.33333333333334" class="bar-label-left">
+    ef=200 avg
+  </text>
+  <rect x="100" y="207.0" width="251.75874288369937" height="32.666666666666664" 
+        fill="#3b82f6" opacity="0.9"/>
+  <text x="361.75874288369937" y="227.33333333333334" 
+        class="bar-label-right" fill="#3b82f6">-32.8%</text>
+
+  <text x="90" y="274.0" class="bar-label-left">
+    ef=200 p95
+  </text>
+  <rect x="100" y="253.66666666666666" width="194.81422273894296" height="32.666666666666664" 
+        fill="#3b82f6" opacity="0.9"/>
+  <text x="304.81422273894293" y="274.0" 
+        class="bar-label-right" fill="#3b82f6">-25.4%</text>
+
+  <text x="90" y="320.66666666666663" class="bar-label-left">
+    ef=200 p99
+  </text>
+  <rect x="100" y="300.3333333333333" width="428.27289362056064" height="32.666666666666664" 
+        fill="#dc2626" opacity="0.9"/>
+  <text x="538.2728936205606" y="320.66666666666663" 
+        class="bar-label-right" fill="#dc2626">-55.9%</text>
+
+</svg>
